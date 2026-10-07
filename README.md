@@ -46,3 +46,83 @@ El método `procesarPedido` actúa simultáneamente en múltiples capas conceptu
     1. Se deben modificar directamente las líneas 75 a 87 dentro del método `procesarPedido` en `GestorPedidos.java`.
     2. Habría que agregar una nueva rama condicional `else if (tipoCliente.equals("CORPORATIVO"))` entrelazada dentro del flujo principal.
     3. **Riesgo:** Al no estar aislada la lógica de descuentos, cualquier modificación accidental en este bloque corre el riesgo de alterar la persistencia o el flujo de notificaciones, exigiendo re-probar el método completo de 340 líneas.
+
+
+## Justificación de Decisiones de Arquitectura
+
+### 1. Validación como Chain of Responsibility vs. Lista de Predicados
+Se eligió **Chain of Responsibility** para la secuencia de validaciones debido a la **dependencia real de orden** y la necesidad de un **corte anticipado (*short-circuiting*)**:
+* **Razón:** Si `ValidadorStock` rechaza el pedido, `ValidadorCliente` ni siquiera debe ejecutarse.
+* **Alternativa considerada:** Método `validarTodo()` con una lista de `Predicate<ContextoPedido>`.
+* **Desventaja de la alternativa:** Evalúa todos los predicados aunque el primero haya fallado y no permite que un validador decida romper la cadena de ejecución directamente.
+
+---
+
+### 2. Descuento como Strategy vs. Eslabón de la Cadena
+Se eligió **Strategy** en lugar de agregar el cálculo de descuento a la cadena de validación porque las reglas de descuento **no tienen dependencia de orden ni necesitan cortar el flujo**:
+* **Razón:** Siempre se aplica exactamente una regla, determinada de forma mutuamente excluyente por el tipo de cliente.
+* **Alternativa considerada:** Añadir un eslabón `ValidadorDescuento` dentro de la cadena.
+* **Desventaja de la alternativa:** Obligaría a crear mecanismos artificiales para evitar la sobreescritura de descuentos o detener la cadena cuando el pedido es válido. Un mapa de selección directa (`SelectorEstrategiaDescuento`) resuelve el problema con menor indirección y eliminando condicionales.
+
+## Diagnóstico de la Parte 2: Antipatrón Golden Hammer (Martillo de Oro)
+
+### 1. Definición del Antipatrón
+El antipatrón **Golden Hammer** ocurre cuando una herramienta, solución o patrón de diseño que funcionó con éxito para un problema específico (en este caso, *Chain of Responsibility* para validaciones secuenciales) se aplica indiscriminadamente a problemas conceptualmente distintos, ignorando si la abstracción sigue siendo adecuada.
+
+### 2. Evidencia Concreta en el Código
+
+1. **Violación del Propósito del Patrón (*Chain of Responsibility*):**
+  * El propósito de `ValidadorPedido` es la verificación y posible rechazo (*short-circuit*) del pedido.
+  * Las clases `PromocionBlackFriday`, `PromocionCorporativo` y `PromocionVolumen` extienden `ValidadorPedido`, pero **ninguna de ellas valida ni rechaza jamás un pedido**. Solo modifican el estado mutable del `ContextoPedido` escribiendo un descuento.
+
+2. **Efectos Secundarios Ocultos y Violación de Responsabilidad:**
+  * Al encadenar `stock.encadenar(cliente).encadenar(blackFriday)...`, el método `validar()` pasa a calcular descuentos de forma implícita. La fase de "validación" deja de ser pura y genera mutaciones laterales.
+
+3. **Incoherencia en el Flujo de Ejecución y Dependencias Incompletas:**
+  * `PromocionVolumen` necesita evaluar las unidades totales del pedido. Sin embargo, como se ejecuta dentro de la fase de validación (antes de que el orquestador calcule e inyecte el subtotal definitivo), se ve obligada a recalcular de forma independiente la cantidad total desde el `PedidoRequest`.
+
+4. **Fragmentación y Duplicidad en el Cálculo de Descuentos:**
+  * El descuento total del pedido queda dividido en dos mecanismos incoherentes:
+    1. Un esquema basado en el patrón **Strategy** (`SelectorEstrategiaDescuento`) para descuentos por tipo de cliente.
+    2. Un esquema mutador basado en **Chain of Responsibility** (`contexto.getDescuentoCampana()`).
+  * El orquestador termina usando un parche explícito: `Math.max(descuentoTipoCliente, contexto.getDescuentoCampana())`, mezclando dos abstracciones totalmente distintas para resolver una misma regla de negocio.
+
+# Paso 6: Diagnóstico del Antipatrón en la Parte 2 (Golden Hammer)
+
+## 1. Identificación del Antipatrón: Golden Hammer (Martillo de Oro)
+
+El problema presente en la Parte 2 no es un *God Object* ni *Spaghetti Code*, ya que el código está modularizado en clases independientes y no existen condicionales profundamente anidados. El problema es de **diseño arquitectónico**: se aplicó el antipatrón **Golden Hammer**, que consiste en reutilizar una solución o patrón que funcionó con éxito en el pasado (*Chain of Responsibility*) para resolver un problema de naturaleza completamente distinta, sin evaluar si la abstracción seguía siendo adecuada.
+
+---
+
+## 2. Respuestas a las Preguntas Guía con Evidencia Concreta
+
+### 1. Dependencia de Orden y Corte Anticipado
+* **Pregunta:** ¿Las tres clases promocionales tienen alguna dependencia de orden entre sí o respecto a `ValidadorStock` y `ValidadorCliente`?
+* **Análisis y Evidencia:**
+  En las validaciones reales existe una dependencia estricta: `ValidadorStock` **debe** ejecutarse antes que `ValidadorCliente` porque si no hay existencias en el inventario, no tiene sentido consultar la base de datos para verificar la mora del cliente.
+  Por el contrario, ejecutar `PromocionVolumen` antes o después de `PromocionCorporativo` o `PromocionBlackFriday` **no altera en absoluto el resultado final**. Ninguna de las tres promociones necesita cortar el flujo de ejecución (*short-circuit*), propiedad fundamental que justificaba el uso de la cadena.
+
+### 2. Violación del Contrato Original y la Abstracción
+* **Pregunta:** ¿Por qué clases que extienden de `ValidadorPedido` nunca rechazan un pedido y solo escriben en un campo compartido?
+* **Análisis y Evidencia:**
+  El contrato abstracto de `ValidadorPedido` define la responsabilidad de *"decidir si el pedido continúa o se rechaza"*. Sin embargo:
+  * `PromocionBlackFriday` (líneas 15-20)
+  * `PromocionCorporativo` (líneas 12-18)
+  * `PromocionVolumen` (líneas 8-13)
+
+  **Nunca invocan `contexto.rechazar(...)`**. Su única función es modificar el estado mutable de `ContextoPedido` llamando a `aplicarDescuentoCampana(...)`. Se forzó la herencia de `ValidadorPedido` simplemente porque la infraestructura de encadenamiento ya estaba construida.
+
+### 3. Rigidez frente a Cambios en las Reglas de Combinación
+* **Pregunta:** ¿Qué pasaría si las campañas necesitaran combinarse (ej. sumar porcentajes) en lugar de competir por el máximo?
+* **Análisis y Evidencia:**
+  El mecanismo actual acopla la regla de combinación dentro de un método mutador en la clase de contexto:
+  ```java
+  public void aplicarDescuentoCampana(double valor) {
+      if (valor > this.descuentoCampana) this.descuentoCampana = valor; // el mayor descuento gana
+  }
+ 
+### 4.Causa Raíz del Error de Diseño
+* **Pregunta:** ¿Se eligió esta solución por ser la más adecuada o porque "ya existía y funcionó la última vez"?
+* **Análisis y Evidencia:**
+La solución se eligió únicamente porque la Chain of Responsibility resolvió el problema de validaciones en la Parte 1. Se "engancharon" tres eslabones más (`stock.encadenar(cliente).encadenar(blackFriday).encadenar(corporativo).encadenar(volumen)`) aprovechando que los eslabones "ya sabían cómo conectarse entre sí", ignorando que el cálculo de promociones es una regla de selección de tarifas (ideal para Strategy) y no una secuencia de validación previa al procesamiento.
